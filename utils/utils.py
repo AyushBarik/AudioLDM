@@ -5,13 +5,11 @@ import IPython.display as ipd
 import matplotlib.pyplot as plt
 import librosa
 import librosa.display
-import torch 
+import torch
 import time
 from audioldm import build_model
 from audioldm.latent_diffusion.ddim import DDIMSampler
 from audioldm.pipeline import duration_to_latent_t_size
-
-
 
 # Visualization functions for spectrograms
 def plot_latent_spectrogram(latent_tensor, title="Latent Spectrogram"):
@@ -21,7 +19,7 @@ def plot_latent_spectrogram(latent_tensor, title="Latent Spectrogram"):
         spec = latent_tensor[0, 0].cpu().numpy()  # Take first batch, first channel
     else:
         spec = latent_tensor.cpu().numpy()
-    
+
     plt.figure(figsize=(12, 6))
     librosa.display.specshow(spec.T, x_axis='time', y_axis='linear', cmap='viridis')
     plt.colorbar(format='%+2.0f dB')
@@ -30,53 +28,44 @@ def plot_latent_spectrogram(latent_tensor, title="Latent Spectrogram"):
     plt.ylabel('Frequency Bins')
     plt.tight_layout()
     plt.show()
-    
+
     print(f"Latent stats - Min: {spec.min():.3f}, Max: {spec.max():.3f}, Mean: {spec.mean():.3f}, Std: {spec.std():.3f}")
 
-def plot_mel_spectrogram(mel_tensor, title="Mel Spectrogram", sr=16000):
-    """Plot mel spectrogram"""
-    # Convert to numpy and take first batch
-    if len(mel_tensor.shape) == 4:  # [batch, channels, freq, time] 
-        spec = mel_tensor[0, 0].cpu().numpy()  # Take first batch, first channel
-    elif len(mel_tensor.shape) == 3:  # [batch, freq, time]
-        spec = mel_tensor[0].cpu().numpy()  # Take first batch
-    else:
-        spec = mel_tensor.cpu().numpy()
-    
-    # Debug shape info
-    print(f"DEBUG: mel_tensor.shape = {mel_tensor.shape}, spec.shape = {spec.shape}")
-    
-    # Ensure we have a 2D spectrogram [freq, time]
-    if len(spec.shape) == 1:
-        # If 1D, reshape based on expected mel dimensions (typically 80 mel bins)
-        expected_mel_bins = 80
-        time_frames = len(spec) // expected_mel_bins
-        spec = spec[:expected_mel_bins * time_frames].reshape(expected_mel_bins, time_frames)
-        print(f"DEBUG: Reshaped 1D to 2D: {spec.shape}")
-    
+def plot_mel_spectrogram(mel_tensor, title="Mel Spectrogram", sr=16000, hop_length=160):
+    """Plot mel spectrogram with robust dimension handling."""
+    # Convert to numpy and remove batch/channel dimensions
+    spec = mel_tensor.squeeze().cpu().numpy()
+
+    # If 3D, take the first channel
+    if spec.ndim > 2:
+        spec = spec[0]
+
+    # Check if the first dimension is time (larger than frequency)
+    if spec.shape[0] > spec.shape[1]:
+        spec = spec.T  # Transpose to [frequency, time]
+
     plt.figure(figsize=(12, 6))
-    librosa.display.specshow(spec, x_axis='time', y_axis='linear', sr=sr, cmap='viridis')
+    # Pass the correct hop_length to specshow
+    librosa.display.specshow(spec, sr=sr, hop_length=hop_length, x_axis='time', y_axis='mel', cmap='viridis')
     plt.colorbar(format='%+2.0f dB')
     plt.title(f'{title} - Shape: {spec.shape}')
-    plt.xlabel('Time')
-    plt.ylabel('Mel Frequency')
     plt.tight_layout()
     plt.show()
-    
+
     print(f"Mel stats - Min: {spec.min():.3f}, Max: {spec.max():.3f}, Mean: {spec.mean():.3f}, Std: {spec.std():.3f}")
 
 def check_for_nan_inf(tensor, name):
     """Check if tensor contains NaN or Inf values"""
     has_nan = torch.isnan(tensor).any()
     has_inf = torch.isinf(tensor).any()
-    
+
     if has_nan:
         print(f"⚠️  WARNING: {name} contains NaN values!")
     if has_inf:
         print(f"⚠️  WARNING: {name} contains Inf values!")
     if not has_nan and not has_inf:
         print(f"✅ {name} is clean (no NaN/Inf)")
-    
+
     return has_nan, has_inf
 
 # MultiDiffusion Helper Functions
@@ -88,9 +77,9 @@ def create_multidiffusion_chunks(total_frames, chunk_size, overlap_ratio=0.75):
     """Create overlapping chunks for MultiDiffusion following the paper approach"""
     overlap_frames = int(chunk_size * overlap_ratio)
     advance_step = chunk_size - overlap_frames
-    
+
     print(f"DEBUG: total_frames={total_frames}, chunk_size={chunk_size}, overlap_frames={overlap_frames}, advance_step={advance_step}")
-    
+
     chunks = []
     start = 0
     while start < total_frames:
@@ -100,7 +89,7 @@ def create_multidiffusion_chunks(total_frames, chunk_size, overlap_ratio=0.75):
         if end >= total_frames:
             break
         start += advance_step
-    
+
     print(f"DEBUG: Created {len(chunks)} chunks covering frames 0-{chunks[-1][1]}")
     return chunks, overlap_frames, advance_step
 
@@ -110,7 +99,7 @@ def pad_chunk_to_size(x_chunk, target_frames):
     if current_frames < target_frames:
         # Pad with zeros on the time dimension
         pad_frames = target_frames - current_frames
-        padding = torch.zeros(x_chunk.shape[0], x_chunk.shape[1], pad_frames, x_chunk.shape[3], 
+        padding = torch.zeros(x_chunk.shape[0], x_chunk.shape[1], pad_frames, x_chunk.shape[3],
                             device=x_chunk.device, dtype=x_chunk.dtype)
         x_chunk = torch.cat([x_chunk, padding], dim=2)
     return x_chunk
@@ -126,22 +115,22 @@ def overlap_average_noise_predictions(noise_predictions, full_shape):
     device = noise_predictions[0][2].device
     weight_sum = torch.zeros(full_shape, device=device)
     weighted_sum = torch.zeros(full_shape, device=device)
-    
+
     for start_frame, end_frame, noise_pred in noise_predictions:
         weighted_sum[:, :, start_frame:end_frame, :] += noise_pred
         weight_sum[:, :, start_frame:end_frame, :] += 1.0
-    
+
     return weighted_sum / weight_sum
 
 def ddim_step_full_tensor(x_full, noise_pred_full, timestep, sampler, index, eta, unconditional_guidance_scale=1.0):
     """Apply DDIM step to full tensor (extracted from p_sample_ddim)"""
-    
+
     # Extract DDIM parameters for this timestep
     a_t = sampler.ddim_alphas[index]
-    a_prev = sampler.ddim_alphas_prev[index] 
+    a_prev = sampler.ddim_alphas_prev[index]
     sigma_t = sampler.ddim_sigmas[index]
     sqrt_one_minus_at = sampler.ddim_sqrt_one_minus_alphas[index]
-    
+
     # Convert to proper tensor shapes
     b = x_full.shape[0]
     device = x_full.device
@@ -149,30 +138,44 @@ def ddim_step_full_tensor(x_full, noise_pred_full, timestep, sampler, index, eta
     a_prev = torch.full((b, 1, 1, 1), a_prev, device=device)
     sigma_t = torch.full((b, 1, 1, 1), sigma_t, device=device)
     sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_at, device=device)
-    
+
     # DDIM math (same as p_sample_ddim)
     pred_x0 = (x_full - sqrt_one_minus_at * noise_pred_full) / a_t.sqrt()
     dir_xt = (1.0 - a_prev - sigma_t**2).sqrt() * noise_pred_full
     noise = sigma_t * torch.randn_like(x_full) if index > 0 else 0.
-    
+
     x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-    
+
     return x_prev
 
-def chunked_noise_prediction(model, x_full, timestep, conditioning, unconditional_conditioning, 
+def ensure_correct_dimensions(tensor, expected_shape):
+    """Ensure the tensor has the correct dimensions, permuting if necessary."""
+    if tensor.shape != expected_shape:
+        print(f"⚠️ Dimension mismatch: Expected {expected_shape}, got {tensor.shape}. Permuting...")
+        # Assuming the mismatch is between time and frequency dimensions
+        tensor = tensor.permute(0, 1, 3, 2)  # Swap time and frequency
+        print(f"✅ Dimensions corrected: {tensor.shape}")
+    return tensor
+
+# Update chunked_noise_prediction to ensure correct dimensions
+def chunked_noise_prediction(model, x_full, timestep, conditioning, unconditional_conditioning,
                            unconditional_guidance_scale, chunks, chunk_frames):
     """Get noise predictions by applying model to chunks, then overlap average"""
-    
+
+    # Ensure x_full has correct dimensions by swapping time and frequency if needed
+    if x_full.shape[2] < x_full.shape[3]:
+        x_full = x_full.permute(0, 1, 3, 2)  # Swap time and frequency
+
     noise_predictions = []
-    
+
     for start_frame, end_frame in chunks:
         # Extract chunk
         x_chunk = x_full[:, :, start_frame:end_frame, :]
         original_chunk_frames = end_frame - start_frame
-        
+
         # Pad chunk to consistent size for U-Net processing
         x_chunk_padded = pad_chunk_to_size(x_chunk, chunk_frames)
-        
+
         # Apply model to padded chunk with CFG
         if unconditional_guidance_scale == 1.0:
             noise_pred_padded = model.apply_model(x_chunk_padded, timestep, conditioning)
@@ -181,20 +184,20 @@ def chunked_noise_prediction(model, x_full, timestep, conditioning, unconditiona
             x_in = torch.cat([x_chunk_padded] * 2)
             t_in = torch.cat([timestep] * 2)
             c_in = torch.cat([unconditional_conditioning, conditioning])
-            
+
             noise_uncond, noise_cond = model.apply_model(x_in, t_in, c_in).chunk(2)
-            
+
             # CFG
             noise_pred_padded = noise_uncond + unconditional_guidance_scale * (noise_cond - noise_uncond)
-        
+
         # Remove padding to get back to original chunk size
         noise_pred = unpad_chunk_result(noise_pred_padded, original_chunk_frames)
-        
+
         noise_predictions.append((start_frame, end_frame, noise_pred))
-    
+
     # Overlap average all noise predictions
     full_noise_pred = overlap_average_noise_predictions(noise_predictions, x_full.shape)
-    
+
     return full_noise_pred
 
 def multidiffusion_sample_clean(sampler, shape, conditioning, unconditional_conditioning,
