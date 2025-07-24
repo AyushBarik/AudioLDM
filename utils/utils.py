@@ -10,6 +10,7 @@ import time
 from audioldm import build_model
 from audioldm.latent_diffusion.ddim import DDIMSampler
 from audioldm.pipeline import duration_to_latent_t_size
+from tqdm import tqdm
 
 # Visualization functions for spectrograms
 def plot_latent_spectrogram(latent_tensor, title="Latent Spectrogram"):
@@ -244,24 +245,21 @@ def multidiffusion_sample_clean(sampler, shape, conditioning, unconditional_cond
     x = x_T.clone()
 
     # Main denoising loop
-    for i, step in enumerate(time_sequence):
-        index = len(timesteps) - i - 1
-        t = torch.full((batch_size,), step, device=device, dtype=torch.long)
+    with tqdm(total=len(time_sequence), desc="Diffusion Steps") as pbar:
+        for i, step in enumerate(time_sequence):
+            index = len(timesteps) - i - 1
+            t = torch.full((batch_size,), step, device=device, dtype=torch.long)
 
-        if i < 5 or i % 20 == 0:
-            mode = "MultiDiffusion" if len(chunks)>1 else "Standard"
-            print(f"Step {i+1}/{len(timesteps)} ({mode}), timestep: {step}")
+            # 1. Chunked noise prediction
+            noise_pred = chunked_noise_prediction(
+                model, x, t, conditioning, unconditional_conditioning,
+                unconditional_guidance_scale, chunks, actual_chunk_size
+            )
 
-        # 1. Chunked noise prediction
-        noise_pred = chunked_noise_prediction(
-            model, x, t, conditioning, unconditional_conditioning,
-            unconditional_guidance_scale, chunks, actual_chunk_size
-        )
+            # 2. DDIM scheduler step
+            x = ddim_step_full_tensor(x, noise_pred, t, sampler, index, eta)
 
-        # 2. DDIM scheduler step
-        x = ddim_step_full_tensor(x, noise_pred, t, sampler, index, eta)
-
-        if i % 20 == 0:
-            print(f"  ✅ Completed step {i+1}")
+            # Update progress bar
+            pbar.update(1)
 
     return x
