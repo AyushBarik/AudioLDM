@@ -263,3 +263,222 @@ def multidiffusion_sample_clean(sampler, shape, conditioning, unconditional_cond
             pbar.update(1)
 
     return x
+
+def multidiffusion_sample_temporal(sampler, shape, segment_embeddings, prompt_segments, 
+                                 unconditional_conditioning, unconditional_guidance_scale, 
+                                 eta, x_T, S=200, chunk_frames=256, overlap_frames=192, duration=30.0,
+                                 full_prompt_emb=None, full_prompt_cfg_scale=None):
+    """
+    Temporal MultiDiffusion with clean segment boundaries (no crossfading).
+    Uses simple, separate prompts with overlap averaging but NO crossfading weights.
+    """
+    model = sampler.model
+    device = model.device
+    sampler.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=False)
+
+    batch_size, channels, total_frames, freq_bins = shape
+    
+    # --- 1. Create chunks and assign a simple prompt to each ---
+    advance_step = chunk_frames - overlap_frames
+    chunks = []
+    chunk_conditionings = []
+    
+    # Use simple prompts, assign based on chunk CENTER with proper boundaries
+    for i in range(0, total_frames, advance_step):
+        start, end = i, min(i + chunk_frames, total_frames)
+        if end - start < chunk_frames // 4 and len(chunks) > 0: 
+            continue  # Skip tiny final chunks
+
+        chunks.append((start, end))
+        
+        # Use chunk CENTER for assignment with inclusive boundaries
+        chunk_center_time = ((start + end) / 2) / 25.6  # frames to seconds
+        
+        # Find which segment this chunk center belongs to
+        assigned_segment = len(prompt_segments) - 1  # Default to last segment
+        segment_name = prompt_segments[-1][2]
+        
+        for j, (seg_start, seg_end, seg_prompt) in enumerate(prompt_segments):
+            # Use <= for end boundary to ensure even distribution
+            if seg_start <= chunk_center_time <= seg_end:
+                assigned_segment = j
+                segment_name = seg_prompt
+                break
+        
+        chunk_conditionings.append(segment_embeddings[assigned_segment])
+        
+        print(f"  Chunk {len(chunks)}: frames[{start}:{end}] time[{start/25.6:.1f}-{end/25.6:.1f}s] CENTER={chunk_center_time:.1f}s -> '{segment_name}' (seg {assigned_segment})")
+
+    print(f"🎭 TEMPORAL MULTIDIFFUSION: Processing {len(chunks)} chunks with clean boundaries (no crossfading).")
+    
+    timesteps = np.flip(sampler.ddim_timesteps[:S])
+    x = x_T.clone()
+
+    with tqdm(total=len(timesteps), desc="Temporal Diffusion") as pbar:
+        for i, step in enumerate(timesteps):
+            index = len(timesteps) - 1 - i
+            t = torch.full((batch_size,), step, device=device, dtype=torch.long)
+            
+            # --- 2. Predict noise for each chunk using its assigned simple prompt ---
+            noise_predictions = []
+            for (start, end), cond in zip(chunks, chunk_conditionings):
+                x_chunk = x[:, :, start:end, :]
+                original_frames = x_chunk.shape[2]
+                
+                x_chunk_padded = pad_chunk_to_size(x_chunk, chunk_frames)
+
+                # Batch conditional and unconditional for efficiency
+                x_in = torch.cat([x_chunk_padded] * 2)
+                t_in = torch.cat([t] * 2)
+                c_in = torch.cat([unconditional_conditioning, cond])
+                
+                noise_uncond, noise_cond = model.apply_model(x_in, t_in, c_in).chunk(2)
+                noise_pred_padded = noise_uncond + unconditional_guidance_scale * (noise_cond - noise_uncond)
+
+                noise_pred = unpad_chunk_result(noise_pred_padded, original_frames)
+                noise_predictions.append((start, end, noise_pred))
+
+            # --- 3. Use standard overlap averaging (NO crossfading weights) ---
+            full_noise_pred = overlap_average_noise_predictions(noise_predictions, x.shape)
+            
+            # --- 4. Perform DDIM step on the full tensor ---
+            x = ddim_step_full_tensor(x, full_noise_pred, t, sampler, index, eta)
+            pbar.update(1)
+    
+    return x
+    """
+    Temporal MultiDiffusion: Apply different prompts to different time segments
+    
+    Args:
+        sampler: DDIM sampler
+        shape: [batch, channels, time_frames, freq_bins]
+        segment_embeddings: List of conditioning embeddings for each prompt segment
+        prompt_segments: List of (start_time, end_time, prompt) tuples
+        unconditional_conditioning: Unconditional embedding for CFG
+        unconditional_guidance_scale: CFG scale
+        eta: DDIM eta parameter
+        x_T: Initial noise tensor
+        S: Number of diffusion steps
+        chunk_frames: Size of each chunk
+        overlap_frames: Overlap between chunks
+        duration: Total duration in seconds
+    
+    Returns:
+        Denoised latent tensor
+    """
+    model = sampler.model
+    device = model.device
+    
+    # Prepare DDIM schedule
+    sampler.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=False)
+    
+    # Unpack shape
+    batch_size, channels, total_frames, freq_bins = shape
+    
+    # Create chunk-to-prompt mapping
+    def get_chunk_conditioning(chunk_start_frame, chunk_end_frame):
+        """Determine which prompt segment(s) this chunk overlaps with"""
+        # Convert chunk frames to time
+        chunk_start_time = chunk_start_frame / 25.6  # frames to seconds
+        chunk_end_time = chunk_end_frame / 25.6
+        chunk_mid_time = (chunk_start_time + chunk_end_time) / 2
+        
+        # Find which segment the chunk center belongs to
+        for i, (seg_start, seg_end, _) in enumerate(prompt_segments):
+            if seg_start <= chunk_mid_time < seg_end:
+                return segment_embeddings[i]
+        
+        # Fallback to last segment if beyond range
+        return segment_embeddings[-1]
+    
+    # Create chunks with overlap
+    advance_step = chunk_frames - overlap_frames
+    chunks = []
+    chunk_conditionings = []
+    
+    for i in range(0, total_frames, advance_step):
+        start = i
+        end = min(start + chunk_frames, total_frames)
+        if end - start < chunk_frames // 2:  # Skip very small final chunks
+            break
+        chunks.append((start, end))
+        
+        # Get conditioning for this chunk
+        chunk_cond = get_chunk_conditioning(start, end)
+        chunk_conditionings.append(chunk_cond)
+        
+        # Convert frames to time for logging
+        start_time = start / 25.6
+        end_time = end / 25.6
+        segment_idx = None
+        for j, (seg_start, seg_end, _) in enumerate(prompt_segments):
+            if seg_start <= (start_time + end_time) / 2 < seg_end:
+                segment_idx = j
+                break
+        
+        print(f"  Chunk {len(chunks)}: frames[{start}:{end}] time[{start_time:.1f}-{end_time:.1f}s] -> prompt segment {segment_idx + 1 if segment_idx is not None else 'N/A'}")
+    
+    print(f"🎭 TEMPORAL MULTIDIFFUSION: {len(chunks)} chunks with temporal conditioning")
+    
+    # Timesteps and reverse order for DDIM
+    timesteps = sampler.ddim_timesteps[:S]
+    time_sequence = np.flip(timesteps)
+    
+    # Initialize current latent
+    x = x_T.clone()
+    
+    # Main denoising loop
+    with tqdm(total=len(time_sequence), desc="Temporal Diffusion") as pbar:
+        for i, step in enumerate(time_sequence):
+            index = len(timesteps) - i - 1
+            t_tensor = torch.full((batch_size,), step, device=device, dtype=torch.long)
+            
+            # Process each chunk with its specific conditioning
+            noise_predictions = []
+            for chunk_idx, ((start, end), chunk_cond) in enumerate(zip(chunks, chunk_conditionings)):
+                # Extract chunk
+                x_chunk = x[:, :, start:end, :]
+                
+                # Apply model with chunk-specific conditioning
+                noise_uncond = model.apply_model(x_chunk, t_tensor, unconditional_conditioning)
+                noise_cond = model.apply_model(x_chunk, t_tensor, chunk_cond)
+                
+                # Classifier-free guidance
+                noise_pred = noise_uncond + unconditional_guidance_scale * (noise_cond - noise_uncond)
+                
+                noise_predictions.append((start, end, noise_pred))
+            
+            # Overlap-average the noise predictions
+            full_noise_pred = torch.zeros_like(x)
+            weight_sum = torch.zeros_like(x)
+            
+            for start, end, noise_pred in noise_predictions:
+                # Create weight mask with linear fade for overlaps
+                chunk_length = end - start
+                weights = torch.ones_like(noise_pred)
+                
+                # Apply fade-in at start (except for first chunk)
+                if start > 0 and overlap_frames > 0:
+                    fade_length = min(overlap_frames, chunk_length // 2)
+                    fade_in = torch.linspace(0, 1, fade_length, device=device)
+                    weights[:, :, :fade_length, :] *= fade_in[None, None, :, None]
+                
+                # Apply fade-out at end (except for last chunk)
+                if end < total_frames and overlap_frames > 0:
+                    fade_length = min(overlap_frames, chunk_length // 2)
+                    fade_out = torch.linspace(1, 0, fade_length, device=device)
+                    weights[:, :, -fade_length:, :] *= fade_out[None, None, :, None]
+                
+                # Add weighted prediction
+                full_noise_pred[:, :, start:end, :] += noise_pred * weights
+                weight_sum[:, :, start:end, :] += weights
+            
+        # Normalize by weights
+        full_noise_pred = full_noise_pred / torch.clamp(weight_sum, min=1e-8)
+        
+        # DDIM step on full tensor
+        x = ddim_step_full_tensor(x, full_noise_pred, t_tensor, sampler, index, eta)
+        
+        pbar.update(1)
+    
+    return x
